@@ -3,3 +3,6 @@ node_modules
 build
 dist
 src/lib/paraglide
+
+# 测试打包产物
+scripts/*.bundle.mjs

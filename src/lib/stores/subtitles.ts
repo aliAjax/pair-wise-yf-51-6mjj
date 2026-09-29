@@ -1,63 +1,38 @@
 import { browser } from "$app/environment";
 import { derived, get, writable } from "svelte/store";
+import { loadInitialState, saveState, startStorageSync } from "$lib/version/persistence";
+import type {
+  BlockedSave,
+  Cue,
+  CueStatus,
+  GlossaryTerm,
+  MergeProposal,
+  PersistedState,
+  ReviewEvent,
+  ReviewRule,
+  Role,
+  Snapshot,
+  TimelineConflict,
+  Track,
+  VersionCredential
+} from "$lib/version/model";
 
-export type TrackStatus = "草稿" | "审校中" | "已通过" | "需修改";
-export type CueStatus = "待译" | "翻译中" | "待审" | "已通过" | "退回";
-export type TermStatus = "建议" | "已锁定";
+export type {
+  Cue,
+  CueStatus,
+  GlossaryTerm,
+  MergeProposal,
+  Release,
+  ReviewEvent,
+  ReviewRule,
+  Role,
+  Snapshot,
+  TimelineConflict,
+  Track,
+  TrackStatus,
+  VersionCredential
+} from "$lib/version/model";
 
-export interface Track {
-  id: string;
-  name: string;
-  locale: "zh" | "en" | "ja";
-  status: TrackStatus;
-}
-
-export interface Cue {
-  id: string;
-  trackId: string;
-  start: number;
-  end: number;
-  source: string;
-  translated: string;
-  status: CueStatus;
-  translator: string;
-  reviewerNote: string;
-}
-
-export interface GlossaryTerm {
-  id: string;
-  source: string;
-  target: string;
-  status: TermStatus;
-  owner: string;
-}
-
-export interface ReviewEvent {
-  id: string;
-  cueId: string;
-  action: "提交审校" | "审校通过" | "退回修改" | "术语锁定";
-  detail: string;
-  actor: string;
-  time: string;
-}
-
-export interface Snapshot {
-  id: string;
-  name: string;
-  time: string;
-  cues: Cue[];
-}
-
-export interface TimelineConflict {
-  id: string;
-  cueId: string;
-  message: string;
-  remoteStart: number;
-  remoteEnd: number;
-  status: "待处理" | "采用本地" | "采用协作版本";
-}
-
-const KEY = "pair-wise-yf-51/subtitles-v1";
 const seedTracks: Track[] = [
   { id: "zh", name: "中文原字幕", locale: "zh", status: "已通过" },
   { id: "en", name: "English 翻译", locale: "en", status: "审校中" },
@@ -74,93 +49,166 @@ const seedTerms: GlossaryTerm[] = [
   { id: "g2", source: "码头", target: "pier", status: "已锁定", owner: "术语管理员" },
   { id: "g3", source: "加固", target: "reinforce", status: "建议", owner: "林岚" }
 ];
-const initial = browser && localStorage.getItem(KEY) ? JSON.parse(localStorage.getItem(KEY)!) : null;
-export const tracks = writable<Track[]>(initial?.tracks ?? seedTracks);
-export const cues = writable<Cue[]>(initial?.cues ?? seedCues);
-export const terms = writable<GlossaryTerm[]>(initial?.terms ?? seedTerms);
-export const reviewEvents = writable<ReviewEvent[]>(initial?.events ?? []);
-export const snapshots = writable<Snapshot[]>(initial?.snapshots ?? []);
-export const conflicts = writable<TimelineConflict[]>([{ id: "x1", cueId: "c2", message: "协作者将结束时间调整为3.0秒，与本机存在0.2秒差异。", remoteStart: 0, remoteEnd: 3, status: "待处理" }]);
-export const activeTrackId = writable("en");
-export const selectedCueId = writable("c2");
-export const reviewer = writable("审校-顾宁");
+const seedConflicts: TimelineConflict[] = [
+  { id: "x1", cueId: "c2", message: "协作者将结束时间调整为3.0秒，与本机存在0.2秒差异。", remoteStart: 0, remoteEnd: 3, status: "待处理" }
+];
+const seedRules: ReviewRule[] = [
+  { id: "r1", name: "术语一致", detail: "译文必须采用已锁定术语；术语锁定变化后，待审字幕重新进入审校。", enabled: true, updatedAt: new Date().toISOString() },
+  { id: "r2", name: "行长限制", detail: "单行字幕不超过 42 个全角字符，超出需拆行或拆分字幕。", enabled: true, updatedAt: new Date().toISOString() },
+  { id: "r3", name: "上下文备注", detail: "退回时必须填写具体原因，供译员按备注修订。", enabled: false, updatedAt: new Date().toISOString() }
+];
 
-function persist() {
-  if (!browser) return;
-  localStorage.setItem(KEY, JSON.stringify({ tracks: get(tracks), cues: get(cues), terms: get(terms), events: get(reviewEvents), snapshots: get(snapshots) }));
-}
-[tracks, cues, terms, reviewEvents, snapshots].forEach((store) => store.subscribe(persist));
-
-function event(cue: Cue | undefined, action: ReviewEvent["action"], detail: string) {
-  reviewEvents.update((items) => [{ id: crypto.randomUUID(), cueId: cue?.id ?? "", action, detail, actor: get(reviewer), time: new Date().toISOString() }, ...items]);
-}
-
-export function updateCue(id: string, patch: Partial<Cue>, log = false) {
-  cues.update((items) => items.map((cue) => cue.id === id ? { ...cue, ...patch } : cue));
-  if (log) event(get(cues).find((cue) => cue.id === id), "退回修改", "编辑字幕内容或时间码");
-}
-
-export function nudgeCue(id: string, delta: number) {
-  const cue = get(cues).find((item) => item.id === id);
-  if (!cue) return;
-  updateCue(id, { start: Math.max(0, Number((cue.start + delta).toFixed(1))), end: Math.max(cue.start + 0.5, Number((cue.end + delta).toFixed(1))) });
-}
-
-export function splitCue(id: string) {
-  const list = get(cues);
-  const cue = list.find((item) => item.id === id);
-  if (!cue || cue.end - cue.start < 1) return;
-  const middle = Number(((cue.start + cue.end) / 2).toFixed(1));
-  const first = { ...cue, end: middle, translated: `${cue.translated}`, status: "翻译中" as CueStatus };
-  const second = { ...cue, id: crypto.randomUUID(), start: middle, translated: "", status: "待译" as CueStatus };
-  cues.set(list.flatMap((item) => item.id === id ? [first, second] : [item]));
-  selectedCueId.set(second.id);
+function seedState(): PersistedState {
+  const cueRevisions: Record<string, number> = {};
+  for (const cue of seedCues) cueRevisions[cue.id] = 1;
+  return {
+    schemaVersion: 2,
+    currentReleaseId: null,
+    releases: [],
+    tracks: seedTracks,
+    cues: seedCues,
+    terms: seedTerms,
+    reviewEvents: [],
+    snapshots: [],
+    conflicts: seedConflicts,
+    rules: seedRules,
+    locks: [],
+    pendingMerges: [],
+    cueRevisions,
+    termRevision: 1,
+    rulesRevision: 1
+  };
 }
 
-export function mergeNext(id: string) {
-  const list = [...get(cues)].sort((a, b) => a.start - b.start).filter((item) => item.trackId === get(activeTrackId));
-  const index = list.findIndex((item) => item.id === id);
-  const current = list[index];
-  const next = list[index + 1];
-  if (!current || !next) return;
-  cues.update((items) => items.filter((item) => item.id !== next.id).map((item) => item.id === id ? { ...item, end: next.end, translated: `${item.translated} ${next.translated}`.trim(), status: "翻译中" } : item));
-}
+/** 统一状态容器：所有版本化数据走一次原子更新，保证持久化的是一致快照。 */
+function createStateStore() {
+  const initial = browser ? loadInitialState(seedState()) : seedState();
+  const { subscribe, set } = writable<PersistedState>(initial);
+  let muted = false;
 
-export function setCueStatus(id: string, status: CueStatus) {
-  updateCue(id, { status });
-  const cue = get(cues).find((item) => item.id === id);
-  event(cue, status === "待审" ? "提交审校" : status === "已通过" ? "审校通过" : "退回修改", cue?.translated ?? "");
-}
-
-export function reviewCue(id: string, approved: boolean, note = "") {
-  const cue = get(cues).find((item) => item.id === id);
-  if (!cue) return;
-  updateCue(id, { status: approved ? "已通过" : "退回", reviewerNote: note });
-  event(cue, approved ? "审校通过" : "退回修改", note || cue.translated);
-}
-
-export function lockTerm(id: string) {
-  terms.update((items) => items.map((term) => term.id === id ? { ...term, status: "已锁定", owner: "术语管理员" } : term));
-  const term = get(terms).find((item) => item.id === id);
-  const cue = get(cues).find((item) => item.id === get(selectedCueId));
-  event(cue, "术语锁定", `${term?.source} → ${term?.target}`);
-}
-
-export function createSnapshot(name = `时间轴快照 ${get(snapshots).length + 1}`) {
-  snapshots.update((items) => [{ id: crypto.randomUUID(), name, time: new Date().toISOString(), cues: structuredClone(get(cues)) }, ...items].slice(0, 12));
-}
-
-export function restoreSnapshot(id: string) {
-  const snapshot = get(snapshots).find((item) => item.id === id);
-  if (snapshot) cues.set(structuredClone(snapshot.cues));
-}
-
-export function resolveConflict(id: string, resolution: TimelineConflict["status"]) {
-  conflicts.update((items) => items.map((item) => item.id === id ? { ...item, status: resolution } : item));
-  if (resolution === "采用协作版本") {
-    const conflict = get(conflicts).find((item) => item.id === id);
-    if (conflict) updateCue(conflict.cueId, { start: conflict.remoteStart, end: conflict.remoteEnd });
+  function persist(state: PersistedState) {
+    if (!browser || muted) return;
+    saveState(state);
   }
+
+  subscribe(persist);
+
+  if (browser) {
+    startStorageSync((remote) => {
+      muted = true;
+      set(remote);
+      muted = false;
+    });
+  }
+
+  return {
+    subscribe,
+    /** 受保护的唯一写入入口，审校流程层通过它完成所有变更。 */
+    commit(updater: (state: PersistedState) => PersistedState) {
+      set(updater(get({ subscribe })));
+    },
+    /** 应用跨标签页同步来的状态（不回写 localStorage，避免回环）。 */
+    hydrate(state: PersistedState) {
+      muted = true;
+      set(state);
+      muted = false;
+    }
+  };
 }
 
-export const activeCues = derived([cues, activeTrackId, selectedCueId], ([$cues, $activeTrackId, $selectedCueId]) => $cues.filter((cue) => cue.trackId === $activeTrackId).sort((a, b) => a.start - b.start).map((cue) => ({ ...cue, selected: cue.id === $selectedCueId })));
+export const stateStore = createStateStore();
+
+// 兼容旧页面的切片 store（均为只读视图，写入请走 $lib/review/workflow）
+export const tracks = derived(stateStore, (state) => state.tracks);
+export const cues = derived(stateStore, (state) => state.cues);
+export const terms = derived(stateStore, (state) => state.terms);
+export const reviewEvents = derived(stateStore, (state) => state.reviewEvents);
+export const snapshots = derived(stateStore, (state) => state.snapshots);
+export const conflicts = derived(stateStore, (state) => state.conflicts);
+export const rules = derived(stateStore, (state) => state.rules);
+export const releases = derived(stateStore, (state) => state.releases);
+export const currentReleaseId = derived(stateStore, (state) => state.currentReleaseId);
+export const pendingMerges = derived(stateStore, (state) => state.pendingMerges);
+export const editLocks = derived(stateStore, (state) => state.locks);
+
+export const activeTrackId = writable("en");
+export const selectedCueId = writable<string | null>("c2");
+export const viewingReleaseId = writable<string | null>(null);
+export const blockedSaves = writable<BlockedSave[]>([]);
+
+// 协作身份：每个标签页独立的会话，制作人 / 译员 / 审校切换角色
+export const sessionId = writable<string>(browser && crypto?.randomUUID ? crypto.randomUUID() : `session-${Math.random().toString(36).slice(2)}`);
+export const identity = writable<{ name: string; role: Role }>({ name: "林岚", role: "译员" });
+export const reviewer = derived(identity, ($identity) => `${$identity.role}-${$identity.name}`);
+
+/** 本标签页各字幕的编辑基线：保存时据此校验版本凭据。 */
+const editBases = new Map<string, VersionCredential>();
+
+export function registerEditBase(cue: Cue, currentReleaseIdValue: string | null): VersionCredential {
+  const revision = get(stateStore).cueRevisions[cue.id] ?? 1;
+  const credential: VersionCredential = {
+    releaseId: currentReleaseIdValue,
+    baseRevision: revision,
+    originalSource: cue.source,
+    originalTranslated: cue.translated,
+    sessionId: get(sessionId)
+  };
+  editBases.set(cue.id, credential);
+  return credential;
+}
+
+export function getEditBase(cueId: string): VersionCredential | undefined {
+  return editBases.get(cueId);
+}
+
+export function clearEditBase(cueId: string) {
+  editBases.delete(cueId);
+}
+
+export function clearAllEditBases() {
+  editBases.clear();
+}
+
+export function addBlockedSave(save: BlockedSave) {
+  blockedSaves.update((items) => [save, ...items].slice(0, 8));
+}
+
+export function dismissBlockedSave(id: string) {
+  blockedSaves.update((items) => items.filter((item) => item.id !== id));
+}
+
+export function cueRevision(cueId: string): number {
+  return get(stateStore).cueRevisions[cueId] ?? 1;
+}
+
+export function currentRelease() {
+  const state = get(stateStore);
+  return state.releases.find((release) => release.id === state.currentReleaseId) ?? null;
+}
+
+export function findRelease(id: string | null) {
+  if (!id) return null;
+  return get(stateStore).releases.find((release) => release.id === id) ?? null;
+}
+
+/** 正在查看的发布版本中的字幕（只读归档）；未查看历史版本时为空。 */
+export const viewingCues = derived([stateStore, viewingReleaseId], ([$state, $viewingReleaseId]) => {
+  if (!$viewingReleaseId) return null;
+  const release = $state.releases.find((item) => item.id === $viewingReleaseId);
+  return release ? { release, cues: release.cues, tracks: release.tracks } : null;
+});
+
+export const activeCues = derived([stateStore, activeTrackId, selectedCueId, viewingReleaseId], ([$state, $activeTrackId, $selectedCueId, $viewingReleaseId]) => {
+  const release = $viewingReleaseId ? $state.releases.find((item) => item.id === $viewingReleaseId) : undefined;
+  const source = release ? release.cues : $state.cues;
+  return source
+    .filter((cue) => cue.trackId === $activeTrackId)
+    .sort((a, b) => a.start - b.start)
+    .map((cue) => ({ ...cue, selected: cue.id === $selectedCueId }));
+});
+
+export function makeMergeProposal(input: Omit<MergeProposal, "id" | "status" | "time">): MergeProposal {
+  return { ...input, id: crypto.randomUUID(), status: "待合并", time: new Date().toISOString() };
+}
+
+export type { ReviewEvent as ReviewEventType };
